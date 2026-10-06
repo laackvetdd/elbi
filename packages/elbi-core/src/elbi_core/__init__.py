@@ -131,7 +131,7 @@ from .metrics import (
     to_osi,
     validate_metric_set,
 )
-from .monitoring import AnomalyVerdict, detect_anomaly
+from .monitoring import AnomalyVerdict, count_flips, detect_anomaly, flapping_keys
 from .orchestration import MaterializationStep, RunResult, asset_status
 from .orchestration import materialize as materialize_assets
 from .param import Param
@@ -329,9 +329,11 @@ __all__ = [
     "certificate_from_run",
     "certify",
     "compile_metric",
+    "count_flips",
     "default_retriever",
     "derivation",
     "detect_anomaly",
+    "flapping_keys",
     "from_osi",
     "get_historical_features",
     "get_online_features",

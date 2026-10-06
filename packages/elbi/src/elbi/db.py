@@ -1052,6 +1052,9 @@ class MetricSnapshot(SQLModel, table=True):
     # The source's oracle verdict at snapshot time: a monitored number rides on a
     # certified metric/derivation, so an alert can say the moved number was verified.
     source_verdict: str | None = Field(default=None)
+    # A keyed monitor's breaching keys at this snapshot, as a JSON list (``None`` when
+    # unkeyed). Persisted so flapping is judged over the whole window across restarts.
+    breach_keys: str | None = Field(default=None)
 
 
 class MonitorIncident(SQLModel, table=True):
@@ -4067,6 +4070,19 @@ class Store:
             )
             return list(session.exec(stmt))
 
+    def list_metric_snapshots_since(
+        self, monitor_id: str, since: datetime
+    ) -> list[MetricSnapshot]:
+        """A monitor's snapshots taken after ``since``, oldest first."""
+        with self._session() as session:
+            stmt = (
+                select(MetricSnapshot)
+                .where(MetricSnapshot.monitor_id == monitor_id)
+                .where(col(MetricSnapshot.at) > since)
+                .order_by(col(MetricSnapshot.at))
+            )
+            return list(session.exec(stmt))
+
     def open_incident(self, monitor_id: str) -> MonitorIncident | None:
         """The monitor's currently-open incident, if any."""
         with self._session() as session:
@@ -4934,6 +4950,7 @@ def migrate(engine: Engine) -> None:
         _migrate_add_column(conn, "saved_query", "copied_from", "VARCHAR")
         _migrate_add_column(conn, "metric", "copied_from", "VARCHAR")
         _migrate_add_column(conn, "monitor_incident", "cause", "VARCHAR")
+        _migrate_add_column(conn, "metric_snapshot", "breach_keys", "VARCHAR")
         for _trash_table in (
             "notebook",
             "notebook_folder",

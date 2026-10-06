@@ -19,6 +19,14 @@ lists them, and a breach that widens while its incident is open raises
 every later one in silence: the sum moves from 1 to 2 and folds into the open incident,
 so the second failure is never announced for as long as the first one stays broken.
 
+A keyed monitor can also watch for flapping, with ``flap: {window: 7d, min_flips: 3}``
+in its config. A row that fails on and off reopens or widens the breach each time and
+clears it in between, so no single reading stands out; counting how often each row
+joins or leaves the breaching set across the window does. A row that reaches
+``min_flips`` raises ``metric.flapping`` once, and again only after it has stopped
+flapping and started over. The breaching keys are stored on each snapshot, so the count
+spans restarts.
+
 The value source, the certified gate, and alert delivery are injected by the app; this
 service owns the snapshot, detection, and incident bookkeeping.
 """
@@ -27,10 +35,10 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from elbi_core import detect_anomaly
+from elbi_core import detect_anomaly, flapping_keys
 
 from .db import MetricMonitor, MetricSnapshot, MonitorIncident, Store
 from .wire import Monitor as WireMonitor
@@ -43,6 +51,7 @@ ANOMALY_DETECTED = "metric.anomaly_detected"
 RECOVERED = "metric.recovered"
 SOURCE_FAILED = "metric.source_failed"
 BREACH_WIDENED = "metric.breach_widened"
+FLAPPING = "metric.flapping"
 
 #: The ``cause`` of an incident opened because the source could not be read. An anomaly
 #: incident carries ``None``, which is also what rows predating the column hold.
@@ -85,6 +94,10 @@ class MonitorService:
         # one already reported. In memory: after a restart the first reading inside an
         # open incident only re-seeds it, so a restart never re-alerts on old keys.
         self._last_keys: dict[str, frozenset[str]] = {}
+        # The keys each flap-watching monitor last found flapping, so a key alerts when
+        # it starts flapping rather than on every check while it is. Re-seeded silently
+        # after a restart, like ``_last_keys``.
+        self._last_flapping: dict[str, frozenset[str]] = {}
 
     def create(
         self,
@@ -111,6 +124,7 @@ class MonitorService:
                 f"{target_kind} {target!r} is not certified; a monitor watches "
                 "only verified numbers"
             )
+        flap_settings(config or {})
         monitor = MetricMonitor(
             name=name.strip() or target,
             target_kind=target_kind,
@@ -174,6 +188,7 @@ class MonitorService:
         row.target_kind = kind
         row.target = watched
         if config is not None:
+            flap_settings(config)
             row.config_json = json.dumps(config)
         if method is not None:
             row.method = method
@@ -278,6 +293,7 @@ class MonitorService:
                 score=verdict.score,
                 reason=verdict.reason,
                 source_verdict=source_verdict,
+                breach_keys=None if keys is None else json.dumps(sorted(keys)),
             )
         )
         alert = self._manage_incident(monitor, verdict, value, source_verdict)
@@ -285,9 +301,12 @@ class MonitorService:
             alert = self._track_keys(
                 monitor, verdict, value, source_verdict, keys, alert
             )
+        flapping = self._track_flapping(monitor) if keys is not None else None
         self._store.touch_metric_monitor(monitor.id, _now())
-        if alert is not None and self._on_alert is not None:
-            self._on_alert(alert)
+        if self._on_alert is not None:
+            for fired in (alert, flapping):
+                if fired is not None:
+                    self._on_alert(fired)
         return {
             "value": value,
             "anomalous": verdict.anomalous,
@@ -296,7 +315,7 @@ class MonitorService:
             "upper": verdict.upper,
             "score": verdict.score,
             "reason": verdict.reason,
-            "alerted": alert is not None,
+            "alerted": alert is not None or flapping is not None,
         }
 
     def _manage_incident(
@@ -371,6 +390,42 @@ class MonitorService:
         widened["breach_keys"] = sorted(current)
         widened["new_keys"] = sorted(added)
         return widened
+
+    def _track_flapping(self, monitor: MetricMonitor) -> dict[str, Any] | None:
+        """Raise ``metric.flapping`` for keys that started flapping at this check."""
+        settings = flap_settings(json.loads(monitor.config_json or "{}"))
+        if settings is None:
+            return None
+        window_hours, min_flips = settings
+        since = _now() - timedelta(hours=window_hours)
+        readings = [
+            json.loads(s.breach_keys)
+            for s in self._store.list_metric_snapshots_since(monitor.id, since)
+            if s.breach_keys is not None
+        ]
+        flips = flapping_keys(readings, min_flips=min_flips)
+        current = frozenset(flips)
+        previous = self._last_flapping.get(monitor.id)
+        self._last_flapping[monitor.id] = current
+        if previous is None:
+            return None
+        started = sorted(current - previous)
+        if not started:
+            return None
+        return {
+            "event": FLAPPING,
+            "monitor_id": monitor.id,
+            "monitor": monitor.name,
+            "target_kind": monitor.target_kind,
+            "target": monitor.target,
+            "flapping_keys": sorted(current),
+            "new_keys": started,
+            "flips": flips,
+            "window_hours": window_hours,
+            "min_flips": min_flips,
+            "reason": f"{', '.join(started)} switched between breaching and clear "
+            f"{min_flips} or more times in {window_hours:g}h",
+        }
 
     def _source_failed(
         self, monitor: MetricMonitor, reason: str
@@ -476,6 +531,35 @@ def _incident_view(incident: MonitorIncident) -> WireMonitorIncident:
         snapshots=incident.snapshots,
         open=incident.closed_at is None,
     )
+
+
+def flap_settings(config: dict[str, Any]) -> tuple[float, int] | None:
+    """A config's flapping window (hours) and flip threshold, ``None`` when unset.
+
+    ``window`` is hours as a number, or a string ending in ``h`` or ``d`` (``36h``,
+    ``7d``); it defaults to 7 days, ``min_flips`` to 3. Checked when a monitor is saved,
+    so a typo is refused there rather than failing every scheduled check.
+
+    Raises:
+        MonitorError: on a malformed window or threshold.
+    """
+    flap = config.get("flap")
+    if flap is None:
+        return None
+    if not isinstance(flap, dict):
+        raise MonitorError("flap must be a mapping with window and min_flips")
+    window = flap.get("window", "7d")
+    try:
+        if isinstance(window, str) and window[-1:] in ("h", "d"):
+            hours = float(window[:-1]) * (24 if window.endswith("d") else 1)
+        else:
+            hours = float(window)
+        min_flips = int(flap.get("min_flips", 3))
+    except (TypeError, ValueError) as exc:
+        raise MonitorError(f"invalid flap settings: {exc}") from exc
+    if hours <= 0 or min_flips < 1:
+        raise MonitorError("flap window must be positive and min_flips at least 1")
+    return hours, min_flips
 
 
 def _iso(value: datetime | None) -> str | None:
