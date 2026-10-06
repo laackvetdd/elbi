@@ -12,5 +12,6 @@ the median does not get dragged toward the very outliers the monitor is looking 
 """
 
 from .detect import AnomalyVerdict, detect_anomaly
+from .flapping import count_flips, flapping_keys
 
-__all__ = ["AnomalyVerdict", "detect_anomaly"]
+__all__ = ["AnomalyVerdict", "count_flips", "detect_anomaly", "flapping_keys"]

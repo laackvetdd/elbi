@@ -34,6 +34,7 @@ EVENT_TYPES: dict[str, bool] = {
     "metric.recovered": False,
     "metric.source_failed": True,
     "metric.breach_widened": True,
+    "metric.flapping": True,
     "run.failed": True,
     "run.slow": False,
     "drift.detected": False,
@@ -94,6 +95,14 @@ def _render(action: str, data: Mapping[str, Any]) -> tuple[str, str, str, str]:
         return (
             f"Monitor {data.get('monitor', '')!r} has new breaching rows",
             f"Newly breaching: {_name_keys(data.get('new_keys'))}",
+            "metric_monitor",
+            str(data.get("monitor_id") or ""),
+        )
+    if action == "metric.flapping":
+        started = ", ".join(str(k) for k in (data.get("new_keys") or []))
+        return (
+            f"Monitor {data.get('monitor', '')!r} has flapping rows",
+            f"Failing on and off: {started}. {data.get('reason') or ''}"[:_ERROR_CAP],
             "metric_monitor",
             str(data.get("monitor_id") or ""),
         )
