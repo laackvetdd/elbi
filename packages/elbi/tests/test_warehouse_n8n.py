@@ -400,3 +400,30 @@ def test_a_node_run_error_beside_its_output_counts_as_swallowed() -> None:
 def test_a_prefix_that_is_not_an_identifier_never_reaches_sql(n8n_db: Path) -> None:
     with pytest.raises(ValueError, match="Invalid n8n table prefix"):
         _read(n8n_db, "workflows", table_prefix='x" --')
+
+
+def test_a_recorded_payload_size_skips_big_runs_without_reading_them(
+    n8n_db: Path,
+) -> None:
+    con = sqlite3.connect(n8n_db)
+    con.execute("ALTER TABLE execution_entity ADD COLUMN jsonSizeBytes INTEGER")
+    con.execute(
+        "UPDATE execution_entity SET jsonSizeBytes = "
+        "(SELECT LENGTH(data) FROM execution_data WHERE executionId = id)"
+    )
+    # Recorded as huge: skipped on the column alone, though the payload is small.
+    con.execute(
+        "UPDATE execution_entity SET jsonSizeBytes = 10000000 "
+        "WHERE workflowId = 'w-swallow'"
+    )
+    # Unknown size (0): never sampled, as n8n leaves it for runs it did not measure.
+    con.execute(
+        "UPDATE execution_entity SET jsonSizeBytes = 0 WHERE workflowId = 'w-awaiting'"
+    )
+    con.commit()
+    con.close()
+    rows = _read(n8n_db, "run_errors")
+    seen = {r["workflow_id"] for r in rows}
+    assert "w-swallow" not in seen
+    assert "w-awaiting" not in seen
+    assert "w-broken" in seen

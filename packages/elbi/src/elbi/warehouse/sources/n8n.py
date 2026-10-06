@@ -488,26 +488,34 @@ class _Reader:
 
         Capped twice: ``sample_per_workflow`` runs per workflow, and payloads over
         ``sample_max_chars`` are skipped, so the pass stays seconds on a database whose
-        full execution history would take minutes to decode.
+        full execution history would take minutes to decode. n8n records each payload's
+        size on the execution row (``jsonSizeBytes``), so where it does, oversized runs
+        are skipped from that column and never read; measuring the payload itself means
+        reading it, which on a large database turns seconds into a minute.
         """
         from sqlalchemy import text
 
+        sized = "jsonSizeBytes" in self.columns(conn, "execution_entity")
+        size_filter = ' AND "jsonSizeBytes" BETWEEN 1 AND :cap' if sized else ""
         sql = (
             'SELECT "id", "workflowId", "status", "startedAt" '  # noqa: S608
             f'FROM {self.t("execution_entity")} WHERE "startedAt" > :cutoff '
             "AND \"mode\" <> 'manual' "
             "AND \"status\" IN ('success', 'error', 'crashed')"
+            + size_filter
             + self.not_deleted(conn)
             + ' ORDER BY "id" DESC'
         )
         picks: dict[str, list[dict[str, Any]]] = {}
-        for row in conn.execute(text(sql), {"cutoff": self.bound_cutoff()}).mappings():
+        bounds = {"cutoff": self.bound_cutoff(), "cap": self.max_chars}
+        for row in conn.execute(text(sql), bounds).mappings():
             chosen = picks.setdefault(str(row["workflowId"]), [])
             if len(chosen) < self.per_workflow:
                 chosen.append(dict(row))
         payload = text(
             f'SELECT "data" FROM {self.t("execution_data")} '  # noqa: S608
-            'WHERE "executionId" = :eid AND LENGTH("data") <= :cap'
+            'WHERE "executionId" = :eid'
+            + ("" if sized else ' AND LENGTH("data") <= :cap')
         )
         out = []
         for wid, runs in picks.items():
