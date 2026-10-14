@@ -60,6 +60,7 @@ describe("EVENT_TYPE_LABELS", () => {
       "metric.recovered",
       "metric.source_failed",
       "metric.breach_widened",
+      "metric.flapping",
       "run.failed",
       "run.slow",
       "drift.detected",

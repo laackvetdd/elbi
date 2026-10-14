@@ -57,6 +57,10 @@ export const EVENT_TYPE_LABELS: Record<string, { label: string; description: str
     label: "Monitor breach widened",
     description: "More rows started breaching while a monitor you configured was alerting",
   },
+  "metric.flapping": {
+    label: "Monitor row flapping",
+    description: "A row a monitor you configured watches keeps switching between breaching and normal",
+  },
   "run.failed": {
     label: "Run failed",
     description: "An orchestration run you own failed",
