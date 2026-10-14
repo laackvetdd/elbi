@@ -4936,6 +4936,7 @@ def open_store(
         if path and path != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
     engine = create_engine(url)
+    apply_store_auth(engine)
     _enable_sqlite_wal(engine)
     migrate(engine)
     return store_class(engine)
@@ -5195,6 +5196,73 @@ def _migrate_conversation_updated_at(conn: Connection) -> None:
         return
     conn.execute(text("ALTER TABLE conversation ADD COLUMN updated_at TIMESTAMP"))
     conn.execute(text("UPDATE conversation SET updated_at = created_at"))
+
+
+#: The Entra scope an Azure Database for PostgreSQL server accepts tokens for.
+_ENTRA_PG_SCOPE = "https://ossrdbms-aad.database.windows.net/.default"
+#: The one ``DB_AUTH`` value understood today.
+_DB_AUTH_MANAGED_IDENTITY = "azure-managed-identity"
+_managed_identity_credential: Any = None
+
+
+def _managed_identity_token() -> str:
+    """An Entra token for Azure Postgres from the app's managed identity.
+
+    ``AZURE_CLIENT_ID`` picks a user-assigned identity; unset, the system-assigned one
+    is used. The credential is built once and caches its token until shortly before it
+    expires, so asking per connection is cheap.
+    """
+    global _managed_identity_credential
+    if _managed_identity_credential is None:
+        try:
+            from azure.identity import ManagedIdentityCredential
+        except ImportError as exc:  # pragma: no cover - depends on the install
+            raise RuntimeError(
+                f"DB_AUTH={_DB_AUTH_MANAGED_IDENTITY} needs azure-identity "
+                "(install elbi-core with the azure extra)."
+            ) from exc
+        client_id = (os.environ.get("AZURE_CLIENT_ID") or "").strip() or None
+        _managed_identity_credential = ManagedIdentityCredential(client_id=client_id)
+    return str(_managed_identity_credential.get_token(_ENTRA_PG_SCOPE).token)
+
+
+def install_entra_auth(
+    engine: Engine, get_token: Callable[[], str]
+) -> Callable[..., None]:
+    """Give every new connection on ``engine`` a fresh Entra token as its password.
+
+    Entra tokens last about an hour, so a token written into ``DB_URI`` would lock the
+    app out of every connection opened after it expires. Fetching one in ``do_connect``
+    keeps pooled connections valid (Postgres checks the password only at sign-in) and
+    keeps the token out of the URL, logs and diagnostics. Returns the hook.
+    """
+    if engine.dialect.name != "postgresql":
+        raise ValueError(
+            f"DB_AUTH={_DB_AUTH_MANAGED_IDENTITY} signs in to Azure Postgres; "
+            f"DB_URI names a {engine.dialect.name} store. Point DB_URI at Postgres "
+            "or unset DB_AUTH."
+        )
+
+    @event.listens_for(engine, "do_connect")
+    def _token_as_password(
+        _dialect: Any, _record: Any, _cargs: Any, cparams: dict[str, Any]
+    ) -> None:
+        cparams["password"] = get_token()
+
+    return _token_as_password
+
+
+def apply_store_auth(engine: Engine) -> Callable[..., None] | None:
+    """Install the sign-in ``DB_AUTH`` asks for, or nothing when it is unset."""
+    mode = (os.environ.get("DB_AUTH") or "").strip().lower()
+    if not mode:
+        return None
+    if mode != _DB_AUTH_MANAGED_IDENTITY:
+        raise ValueError(
+            f"DB_AUTH={mode!r} is not understood. The supported value is "
+            f"{_DB_AUTH_MANAGED_IDENTITY!r} (Azure Postgres with an Entra token)."
+        )
+    return install_entra_auth(engine, lambda: _managed_identity_token())
 
 
 def _enable_sqlite_wal(engine: Engine) -> None:

@@ -46,6 +46,12 @@ openssl rand -hex 32
 (`postgres://user:pass@host:5432/elbi`) if you outgrow that; the schema is created on
 first start either way.
 
+On Azure Database for PostgreSQL with password sign-in turned off, give the container a
+managed identity that is a Postgres Entra admin or role, leave the password out of
+`DB_URI`, and set `DB_AUTH=azure-managed-identity` (plus `AZURE_CLIENT_ID` for a
+user-assigned identity). Each new connection then signs in with a fresh Entra token, so
+nothing expires an hour after start. Add `?sslmode=require` to the URI.
+
 `STORAGE_URI` is where synced warehouse tables land. A path inside the volume by
 default, or `s3://`, `gs://`, `az://` for object storage.
 

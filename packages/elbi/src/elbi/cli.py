@@ -87,13 +87,14 @@ def _collect_diagnostics() -> dict[str, Any]:
     from sqlalchemy import text
     from sqlmodel import create_engine
 
-    from .db import DEFAULT_DB_URI, sqlalchemy_url
+    from .db import DEFAULT_DB_URI, apply_store_auth, sqlalchemy_url
 
     db_uri = os.environ.get("DB_URI") or DEFAULT_DB_URI
     url = sqlalchemy_url(db_uri)
     store_info: dict[str, Any] = {"uri": _redact_uri(url)}
     try:
         engine = create_engine(url)
+        apply_store_auth(engine)
         try:
             with engine.connect() as conn:
                 conn.execute(text("SELECT 1"))
