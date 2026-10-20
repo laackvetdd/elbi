@@ -275,3 +275,67 @@ def test_live_clickhouse_does_not_duplicate_rows_on_an_incremental_read() -> Non
         source, _CLICKHOUSE, "live_hits", incremental_field="id", incremental_since=1
     )
     assert [r["id"] for r in later] == [2, 3]
+
+
+# --- Azure Database for PostgreSQL, signed in by a managed identity ------------------
+
+_AZURE = {
+    "host": "ids-pg.postgres.database.azure.com",
+    "database": "cmpd_memory",
+    "user": "elbi-ro",
+}
+
+
+def test_azure_postgres_has_no_password_field_and_requires_the_role() -> None:
+    form = SourceRegistry.get("azure_postgres").config
+    names = [f.name for f in form.fields]
+    assert "password" not in names
+    assert next(f for f in form.fields if f.name == "user").required is True
+    assert form.category == "Databases"
+
+
+def test_azure_postgres_url_requires_tls_and_never_carries_a_password() -> None:
+    src = SourceRegistry.get("azure_postgres")
+    url = src._url({**_AZURE, "password": "typed-anyway"})  # type: ignore[attr-defined]
+    assert (
+        url
+        == "postgresql+psycopg://elbi-ro:@ids-pg.postgres.database.azure.com:5432/cmpd_memory?sslmode=require"
+    )
+    assert "typed-anyway" not in url
+    assert src._remote_port(_AZURE) == 5432  # type: ignore[attr-defined]
+
+
+def test_azure_postgres_signs_every_connection_in_with_a_fresh_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import elbi.db as db
+
+    tokens = iter(["tok-1", "tok-2"])
+    monkeypatch.setattr(db, "_managed_identity_token", lambda: next(tokens))
+    engine = SourceRegistry.get("azure_postgres")._engine(_AZURE)  # type: ignore[attr-defined]
+    seen: list[str] = []
+    for _ in range(2):
+        cparams: dict[str, str] = {}
+        engine.dialect.dispatch.do_connect(engine.dialect, None, [], cparams)
+        seen.append(cparams["password"])
+    assert seen == ["tok-1", "tok-2"]
+    engine.dispose()
+
+
+def test_azure_postgres_lists_views_beside_tables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sqlalchemy import create_engine, text
+
+    engine = create_engine("sqlite://")
+    with engine.begin() as conn:
+        conn.execute(text("CREATE TABLE raw (id INTEGER, created_at TEXT)"))
+        conn.execute(
+            text("CREATE VIEW checks AS SELECT 'a' AS check_name, 0 AS breach")
+        )
+    src = SourceRegistry.get("azure_postgres")
+    monkeypatch.setattr(type(src), "_engine", lambda self, config: engine)
+    found = {
+        s.name: s.incremental_fields for s in src.schemas({**_AZURE, "schema": None})
+    }  # type: ignore[attr-defined]
+    assert found == {"raw": ["id", "created_at"], "checks": []}

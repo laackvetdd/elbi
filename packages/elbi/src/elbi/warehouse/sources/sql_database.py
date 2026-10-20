@@ -51,6 +51,7 @@ _DEFAULT_PORTS = {
     "mssql": 1433,
     "redshift": 5439,
     "supabase": 5432,
+    "azure_postgres": 5432,
     "neon": 5432,
     "cockroachdb": 26257,
     "planetscale": 3306,
@@ -247,6 +248,68 @@ class PostgresSource(_SqlSource):
     dialect = "postgres"
     label = "PostgreSQL"
     icon = "🐘"
+
+
+@SourceRegistry.register
+class AzurePostgresSource(PostgresSource):
+    """Azure Database for PostgreSQL with password sign-in off.
+
+    Such a server accepts only an Entra access token as the password, and a token
+    lasts about an hour, so a token typed into the form would lock the source out of
+    every sync after it expires. This source has no password field: each new
+    connection fetches a fresh token from the container's managed identity
+    (``AZURE_CLIENT_ID`` picks a user-assigned one), the same sign-in
+    ``DB_AUTH=azure-managed-identity`` gives the store. ``user`` is the Postgres role
+    mapped to that identity. TLS is required.
+    """
+
+    dialect = "azure_postgres"
+    wire = "postgres"
+    label = "Azure Database for PostgreSQL (managed identity)"
+    icon = "🐘"
+
+    @property
+    def config(self) -> SourceConfig:
+        """The Postgres form without a password: the managed identity signs in."""
+        base = super().config
+        fields = [f for f in base.fields if f.name != "password"]
+        for f in fields:
+            if f.name == "user":
+                f.required = True
+                f.caption = (
+                    "The Postgres role mapped to the container's managed identity."
+                )
+        return replace(base, fields=fields)
+
+    def _url(self, config: dict[str, Any]) -> str:
+        bare = {k: v for k, v in config.items() if k != "password"}
+        return f"{super()._url(bare)}?sslmode=require"
+
+    def _engine(self, config: dict[str, Any]) -> Engine:
+        from ...db import _managed_identity_token, install_entra_auth
+
+        engine = super()._engine(config)
+        install_entra_auth(engine, _managed_identity_token)
+        return engine
+
+    def schemas(self, config: dict[str, Any]) -> list[SourceSchema]:
+        """Tables and views in the schema.
+
+        A view is how a database owner hands out a narrow, pre-aggregated read (counts
+        and labels, no row text) to a role that can see nothing else. The plain
+        Postgres source lists tables only, which would leave such a role with nothing
+        to sync. A view has no cursor column worth trusting, so it syncs in full.
+        """
+        from sqlalchemy import inspect
+
+        out = super().schemas(config)
+        seen = {s.name for s in out}
+        schema = config.get("schema") or None
+        with self._routed(config) as reachable:
+            for view in inspect(self._engine(reachable)).get_view_names(schema=schema):
+                if view not in seen:
+                    out.append(SourceSchema(name=view, incremental_fields=[]))
+        return out
 
 
 # Supabase shows three different hostnames in its dashboard and only two of them are a
